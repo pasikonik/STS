@@ -1,0 +1,24 @@
+{
+	"name": "spotify-transcript-retriever",
+	"version": "1.0.0",
+	"description": "A Node.js application to retrieve Spotify podcast episode transcripts",
+	"main": "index.js",
+	"scripts": {
+		"start": "node index.js",
+		"dev": "nodemon --verbose index.js",
+		"test": "echo \"Error: no tests specified\" && exit 1"
+	},
+	"author": "Your Name",
+	"license": "ISC",
+	"dependencies": {
+		"express": "^4.21.2",
+		"puppeteer": "^24.4.0",
+		"dotenv": "^16.4.7"
+	},
+	"devDependencies": {
+		"nodemon": "^3.1.0"
+	},
+	"engines": {
+		"node": ">=18.0.0"
+	}
+}
