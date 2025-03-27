@@ -176,7 +176,7 @@ app.get('/transcript/:episodeId', async (req, res) => {
         const transcriptText = await page.evaluate(() => {
             const transcriptSegments = document.querySelectorAll('div[class^="NavBar__NavBarPage"] > div:not(:first-child)');
 
-            if (!childDivs) {
+            if (!transcriptSegments) {
                 return null;
             }
 

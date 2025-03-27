@@ -39,3 +39,8 @@ Thumbs.db
 # Testy i raporty
 coverage/
 .nyc_output/
+
+
+# tmp auth
+spotify-cookies.json
+spotify-login-state.json
