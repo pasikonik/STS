@@ -1,15 +1,23 @@
-const express = require('express');
-const puppeteer = require('puppeteer');
-const dotenv = require('dotenv');
-const fs = require('fs').promises;
-const path = require('path');
-const { createClient } = require('redis');
+import express from 'express';
+import puppeteer from 'puppeteer';
+import dotenv from 'dotenv';
+import fs from 'fs/promises';
+import path from 'path';
+import morgan from 'morgan';
+import { createClient } from 'redis';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
+
+app.use(morgan(':remote-addr :method :url :status :res[content-length] - :response-time ms'));
 
 const COOKIES_PATH = path.resolve(__dirname, 'spotify-cookies.json');
 const STATE_PATH = path.resolve(__dirname, 'spotify-login-state.json');
@@ -20,6 +28,7 @@ redisClient.on('error', (err) => console.error('Redis Client Error:', err));
 
 (async () => {
     await redisClient.connect();
+    console.log('Redis client connected');
 })();
 
 class SpotifyAuthManager {
@@ -38,7 +47,9 @@ class SpotifyAuthManager {
         try {
             const stateData = await fs.readFile(STATE_PATH, 'utf8');
             const { timestamp } = JSON.parse(stateData);
-            return (Date.now() - timestamp) < 7 * 24 * 60 * 60 * 1000;
+            const isValid = (Date.now() - timestamp) < 7 * 24 * 60 * 60 * 1000;
+            console.log(`Login state valid: ${isValid}`);
+            return isValid;
         } catch (err) {
             console.error('Failed to read login state:', err);
             return false;
@@ -48,13 +59,16 @@ class SpotifyAuthManager {
     static async saveLoginState() {
         try {
             await fs.writeFile(STATE_PATH, JSON.stringify({ timestamp: Date.now() }), 'utf8');
+            console.log('Cookies saved');
         } catch (err) {
-            console.error('Failed to save login state:', err);
+            console.error('Error loading cookies:', err);
+            return false;
         }
     }
 
     static async saveCookies(page) {
         try {
+            console.log('Attempting login to Spotify...');
             const cookies = await page.cookies();
             await fs.writeFile(COOKIES_PATH, JSON.stringify(cookies), 'utf8');
         } catch (err) {
@@ -77,6 +91,7 @@ class SpotifyAuthManager {
 
     static async performLogin(page) {
         try {
+            console.log('Attempting login to Spotify...');
             await page.goto('https://accounts.spotify.com/login', {
                 waitUntil: 'networkidle0',
                 timeout: 60000
@@ -95,8 +110,10 @@ class SpotifyAuthManager {
 
             await this.saveCookies(page);
             await this.saveLoginState();
+            console.log('Login successful');
         } catch (err) {
             throw new Error('Login failed: ' + err.message);
+            throw new Error('Login failed');
         }
     }
 
@@ -105,6 +122,7 @@ class SpotifyAuthManager {
         const cookiesLoaded = isValidState && await this.loadCookies(page);
 
         try {
+            console.log(`Navigating to episode page: ${episodeId}`);
             await page.goto(`https://open.spotify.com/episode/${episodeId}`, {
                 waitUntil: 'networkidle0',
                 timeout: 60000
@@ -133,15 +151,21 @@ class SpotifyAuthManager {
     }
 }
 
+app.get('/', async (req, res) => {
+    res.send('✅ Serwer działa poprawnie');
+});
+
 app.get('/transcript/:episodeId', async (req, res) => {
     const { episodeId } = req.params;
     const redisKey = `transcript:${episodeId}`;
     let browser;
 
     try {
+        console.log(`Request received for episode: ${episodeId}`);
         // STEP 1: Check cache
         const cachedTranscript = await redisClient.get(redisKey);
         if (cachedTranscript) {
+            console.log(`Cache hit for episode ${episodeId}`);
             return res.json({
                 episodeId,
                 transcript: cachedTranscript,
@@ -149,6 +173,7 @@ app.get('/transcript/:episodeId', async (req, res) => {
             });
         }
 
+        console.log(`Cache miss for episode ${episodeId}. Launching Puppeteer...`);
         // STEP 2: Launch Puppeteer
         browser = await puppeteer.launch({
             headless: true,
@@ -182,6 +207,7 @@ app.get('/transcript/:episodeId', async (req, res) => {
         });
 
         if (!clickedTranscript) {
+            console.warn('Transcript tab not found');
             return res.status(404).json({ error: 'Transcript tab not found' });
         }
 
@@ -202,11 +228,13 @@ app.get('/transcript/:episodeId', async (req, res) => {
         });
 
         if (!transcript) {
+            console.warn('Transcript not found or empty');
             return res.status(404).json({ error: 'Transcript not found or empty' });
         }
 
         // STEP 3: Cache it in Redis for 24h
         await redisClient.set(redisKey, transcript, { EX: 60 * 60 * 24 });
+        console.log(`Transcript cached for episode ${episodeId}`);
 
         return res.json({ episodeId, transcript, source: 'fresh' });
 

@@ -1,6 +1,7 @@
 {
 	"name": "spotify-transcript-retriever",
 	"version": "1.0.0",
+	"type": "module",
 	"description": "A Node.js application to retrieve Spotify podcast episode transcripts",
 	"main": "index.js",
 	"scripts": {
@@ -12,6 +13,7 @@
 	"dependencies": {
 		"dotenv": "^16.4.7",
 		"express": "^4.21.2",
+		"morgan": "^1.10.0",
 		"puppeteer": "^24.4.0",
 		"redis": "^4.7.0"
 	},
