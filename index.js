@@ -3,100 +3,128 @@ const puppeteer = require('puppeteer');
 const dotenv = require('dotenv');
 const fs = require('fs').promises;
 const path = require('path');
+const { createClient } = require('redis');
 
-// Load environment variables
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
-// Path for storing login state
 const COOKIES_PATH = path.resolve(__dirname, 'spotify-cookies.json');
 const STATE_PATH = path.resolve(__dirname, 'spotify-login-state.json');
 
+const redisClient = createClient({ url: REDIS_URL });
+
+redisClient.on('error', (err) => console.error('Redis Client Error:', err));
+
+(async () => {
+    await redisClient.connect();
+})();
 
 class SpotifyAuthManager {
-    static async checkLoginState() {
+    static async fileExists(filePath) {
         try {
-            // Check if state file exists
-            const stateExists = await fs.access(STATE_PATH)
-                .then(() => true)
-                .catch(() => false);
+            await fs.access(filePath);
+            return true;
+        } catch {
+            return false;
+        }
+    }
 
-            if (!stateExists) {
-                return false;
-            }
+    static async checkLoginState() {
+        if (!(await this.fileExists(STATE_PATH))) return false;
 
-            // Read state file
+        try {
             const stateData = await fs.readFile(STATE_PATH, 'utf8');
-            const loginState = JSON.parse(stateData);
-
-            // Check if state is still valid (e.g., within 7 days)
-            const currentTime = Date.now();
-            return (currentTime - loginState.timestamp) < (7 * 24 * 60 * 60 * 1000);
-        } catch (error) {
-            console.error('Error checking login state:', error);
+            const { timestamp } = JSON.parse(stateData);
+            return (Date.now() - timestamp) < 7 * 24 * 60 * 60 * 1000;
+        } catch (err) {
+            console.error('Failed to read login state:', err);
             return false;
         }
     }
 
     static async saveLoginState() {
-        const stateData = {
-            timestamp: Date.now()
-        };
-
-        await fs.writeFile(STATE_PATH, JSON.stringify(stateData), 'utf8');
+        try {
+            await fs.writeFile(STATE_PATH, JSON.stringify({ timestamp: Date.now() }), 'utf8');
+        } catch (err) {
+            console.error('Failed to save login state:', err);
+        }
     }
 
     static async saveCookies(page) {
-        const cookies = await page.cookies();
-        await fs.writeFile(COOKIES_PATH, JSON.stringify(cookies), 'utf8');
+        try {
+            const cookies = await page.cookies();
+            await fs.writeFile(COOKIES_PATH, JSON.stringify(cookies), 'utf8');
+        } catch (err) {
+            console.error('Failed to save cookies:', err);
+        }
     }
 
     static async loadCookies(page) {
+        if (!(await this.fileExists(COOKIES_PATH))) return false;
+
         try {
-            const cookiesString = await fs.readFile(COOKIES_PATH, 'utf8');
-            const cookies = JSON.parse(cookiesString);
+            const cookies = JSON.parse(await fs.readFile(COOKIES_PATH, 'utf8'));
             await page.setCookie(...cookies);
             return true;
-        } catch (error) {
-            console.error('Error loading cookies:', error);
+        } catch (err) {
+            console.error('Error loading cookies:', err);
             return false;
         }
     }
 
     static async performLogin(page) {
-        // Navigate to Spotify login page
-        await page.goto('https://accounts.spotify.com/login', {
-            waitUntil: 'networkidle0',
-            timeout: 60000
-        });
+        try {
+            await page.goto('https://accounts.spotify.com/login', {
+                waitUntil: 'networkidle0',
+                timeout: 60000
+            });
 
-        // Wait for username input and type slowly
-        await page.waitForSelector('#login-username', { visible: true });
-        await page.type('#login-username', process.env.SPOTIFY_EMAIL, { delay: 100 });
+            await page.waitForSelector('#login-username', { visible: true });
+            await page.type('#login-username', process.env.SPOTIFY_EMAIL);
 
-        // Wait for password input and type slowly
-        await page.waitForSelector('#login-password', { visible: true });
-        await page.type('#login-password', process.env.SPOTIFY_PASSWORD, { delay: 100 });
+            await page.waitForSelector('#login-password', { visible: true });
+            await page.type('#login-password', process.env.SPOTIFY_PASSWORD);
 
-        // Click login button with wait
-        await page.click('#login-button');
+            await Promise.all([
+                page.click('#login-button'),
+                page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 60000 })
+            ]);
 
-        // Wait for navigation and potential challenges
-        await page.waitForNavigation({
-            waitUntil: 'networkidle0',
-            timeout: 60000
-        });
+            await this.saveCookies(page);
+            await this.saveLoginState();
+        } catch (err) {
+            throw new Error('Login failed: ' + err.message);
+        }
+    }
 
-        // Save cookies and login state
-        await this.saveCookies(page);
-        await this.saveLoginState();
+    static async ensureLoggedIn(page, episodeId) {
+        const isValidState = await this.checkLoginState();
+        const cookiesLoaded = isValidState && await this.loadCookies(page);
+
+        try {
+            await page.goto(`https://open.spotify.com/episode/${episodeId}`, {
+                waitUntil: 'networkidle0',
+                timeout: 60000
+            });
+
+            const isStillLoggedIn = await this.verifyLogin(page);
+            if (!isStillLoggedIn || !cookiesLoaded) {
+                await this.performLogin(page);
+                await page.goto(`https://open.spotify.com/episode/${episodeId}`, {
+                    waitUntil: 'networkidle0',
+                    timeout: 60000
+                });
+            }
+        } catch (err) {
+            throw new Error('Login verification failed: ' + err.message);
+        }
     }
 
     static async verifyLogin(page) {
         try {
-            // Check for user widget or logged-in state indicator
             await page.waitForSelector('[data-testid="user-widget-link"]', { timeout: 10000 });
             return true;
         } catch {
@@ -107,117 +135,89 @@ class SpotifyAuthManager {
 
 app.get('/transcript/:episodeId', async (req, res) => {
     const { episodeId } = req.params;
-
+    const redisKey = `transcript:${episodeId}`;
     let browser;
+
     try {
-        // Launch browser 
+        // STEP 1: Check cache
+        const cachedTranscript = await redisClient.get(redisKey);
+        if (cachedTranscript) {
+            return res.json({
+                episodeId,
+                transcript: cachedTranscript,
+                source: 'cache'
+            });
+        }
+
+        // STEP 2: Launch Puppeteer
         browser = await puppeteer.launch({
-            headless: false,
+            headless: true,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process'
+                '--mute-audio',
+                '--disable-dev-shm-usage',
+                '--disable-background-networking',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-sync',
             ],
-            defaultViewport: null
+            timeout: 10000
         });
 
         const page = await browser.newPage();
-
-        // Set user agent
         await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+        page.setDefaultTimeout(60000);
 
-        // Increase timeout
-        await page.setDefaultTimeout(60000);
+        await SpotifyAuthManager.ensureLoggedIn(page, episodeId);
 
-        // Check if already logged in via cached state
-        const isLoggedInState = await SpotifyAuthManager.checkLoginState();
-
-        if (isLoggedInState) {
-            // Try to load cookies
-            const cookiesLoaded = await SpotifyAuthManager.loadCookies(page);
-
-            // Navigate to episode page
-            await page.goto(`https://open.spotify.com/episode/${episodeId}`, {
-                waitUntil: 'networkidle0',
-                timeout: 60000
-            });
-
-            // Verify login is still valid
-            const isLoginValid = await SpotifyAuthManager.verifyLogin(page);
-
-            if (!isLoginValid || !cookiesLoaded) {
-                // Perform full login if cookies are invalid
-                await SpotifyAuthManager.performLogin(page);
+        const clickedTranscript = await page.evaluate(() => {
+            const tab = Array.from(document.querySelectorAll('a')).find(el =>
+                el.textContent.toLowerCase().includes('transcript'));
+            if (tab) {
+                tab.click();
+                return true;
             }
-        } else {
-            // Perform full login
-            await SpotifyAuthManager.performLogin(page);
-        }
-
-        // Wait for transcript tab and click
-        await page.evaluate(() => {
-            const transcriptTabs = Array.from(document.querySelectorAll('a'))
-                .filter(button => button.textContent.toLowerCase().includes('transcript'));
-
-            if (transcriptTabs.length > 0) {
-                transcriptTabs[0].click();
-                console.log('After click Transcript tab ');
-            } else {
-                console.error('Transcript tab not found');
-            }
+            return false;
         });
 
-        // Wait for transcript container
-        await page.waitForSelector('div[class^="NavBar__NavBarPage"]', { timeout: 30000 });
-        console.log('Transcript container found');
+        if (!clickedTranscript) {
+            return res.status(404).json({ error: 'Transcript tab not found' });
+        }
 
-        // Extract transcript text
-        const transcriptText = await page.evaluate(() => {
-            const transcriptSegments = document.querySelectorAll('div[class^="NavBar__NavBarPage"] > div:not(:first-child)');
+        await page.waitForSelector('div[class^="NavBar__NavBarPage"]', { timeout: 10000 });
 
-            if (!transcriptSegments) {
-                return null;
-            }
+        const transcript = await page.evaluate(() => {
+            const container = document.querySelector('div[class^="NavBar__NavBarPage"]');
+            if (!container) return null;
 
-            const mergedText = Array.from(transcriptSegments)
+            return Array.from(container.querySelectorAll('div:not(:first-child)'))
                 .map(div => {
-                    const timeStamp = div.querySelector('span[data-encore-id="text"]')?.textContent.trim();
-                    const textContent = div.querySelector('span[dir="auto"]')?.textContent.trim();
-                    return timeStamp && textContent ? `${timeStamp}\n${textContent}` : '';
+                    const time = div.querySelector('span[data-encore-id="text"]')?.textContent.trim();
+                    const text = div.querySelector('span[dir="auto"]')?.textContent.trim();
+                    return time && text ? `${time}\n${text}` : null;
                 })
-                .filter(text => text !== '')
+                .filter(Boolean)
                 .join('\n\n');
-
-            return mergedText;
         });
 
-        // Send transcript as response
-        if (transcriptText) {
-            res.json({
-                episodeId,
-                transcript: transcriptText
-            });
-        } else {
-            res.status(404).json({
-                error: 'Transcript not found'
-            });
+        if (!transcript) {
+            return res.status(404).json({ error: 'Transcript not found or empty' });
         }
 
-    } catch (error) {
-        console.error('Transcript retrieval error:', error);
-        res.status(500).json({
-            error: 'Failed to retrieve transcript',
-            details: error.message
-        });
+        // STEP 3: Cache it in Redis for 24h
+        await redisClient.set(redisKey, transcript, { EX: 60 * 60 * 24 });
+
+        return res.json({ episodeId, transcript, source: 'fresh' });
+
+    } catch (err) {
+        console.error('Transcript retrieval failed:', err);
+        res.status(500).json({ error: 'Internal server error', details: err.message });
     } finally {
-        if (browser) {
-            await browser.close();
-        }
+        if (browser) await browser.close();
     }
 });
 
-// Start server
 app.listen(PORT, () => {
     console.log(`Transcript retrieval service running on port ${PORT}`);
 });

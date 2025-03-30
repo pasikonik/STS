@@ -44,3 +44,4 @@ coverage/
 # tmp auth
 spotify-cookies.json
 spotify-login-state.json
+.vercel

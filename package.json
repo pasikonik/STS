@@ -5,15 +5,15 @@
 	"main": "index.js",
 	"scripts": {
 		"start": "node index.js",
-		"dev": "nodemon --verbose index.js",
-		"test": "echo \"Error: no tests specified\" && exit 1"
+		"dev": "nodemon --verbose index.js"
 	},
 	"author": "Your Name",
 	"license": "ISC",
 	"dependencies": {
+		"dotenv": "^16.4.7",
 		"express": "^4.21.2",
 		"puppeteer": "^24.4.0",
-		"dotenv": "^16.4.7"
+		"redis": "^4.7.0"
 	},
 	"devDependencies": {
 		"nodemon": "^3.1.0"
