@@ -113,7 +113,6 @@ class SpotifyAuthManager {
             console.log('Login successful');
         } catch (err) {
             throw new Error('Login failed: ' + err.message);
-            throw new Error('Login failed');
         }
     }
 
@@ -152,7 +151,7 @@ class SpotifyAuthManager {
 }
 
 app.get('/', async (req, res) => {
-    res.send('✅ Serwer działa poprawnie');
+    res.send('Serwer STS działa poprawnie ✔️');
 });
 
 app.get('/transcript/:episodeId', async (req, res) => {
